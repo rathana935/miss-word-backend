@@ -1,8 +1,20 @@
--- ============================================
+-- ============================================================
 -- MISSING WORDS DATABASE
--- ============================================
+-- Production PostgreSQL Schema
+-- ============================================================
 
+-- ============================================================
+-- EXTENSIONS
+-- MUST COME BEFORE TABLES USING gen_random_uuid()
+-- ============================================================
+
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+
+-- ============================================================
 -- USERS
+-- ============================================================
+
 CREATE TABLE IF NOT EXISTS users (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 
@@ -38,16 +50,40 @@ CREATE TABLE IF NOT EXISTS users (
     referral_progress_coins BIGINT NOT NULL DEFAULT 0,
 
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    CHECK (coins >= 0),
+    CHECK (lives >= 0),
+    CHECK (lives <= 5),
+    CHECK (hints >= 0),
+    CHECK (total_games >= 0),
+    CHECK (total_ads >= 0),
+    CHECK (life_ads_used >= 0),
+    CHECK (hint_ads_used >= 0),
+    CHECK (successful_referrals >= 0),
+    CHECK (referral_progress_coins >= 0)
 );
 
 
--- ============================================
+CREATE INDEX IF NOT EXISTS idx_users_telegram_id
+ON users(telegram_id);
+
+CREATE INDEX IF NOT EXISTS idx_users_referral_code
+ON users(referral_code);
+
+CREATE INDEX IF NOT EXISTS idx_users_referred_by
+ON users(referred_by);
+
+CREATE INDEX IF NOT EXISTS idx_users_coins
+ON users(coins DESC);
+
+
+-- ============================================================
 -- AUTH SESSIONS
--- ============================================
+-- ============================================================
 
 CREATE TABLE IF NOT EXISTS auth_sessions (
-    id UUID PRIMARY KEY,
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 
     user_id UUID NOT NULL
         REFERENCES users(id)
@@ -66,14 +102,16 @@ CREATE TABLE IF NOT EXISTS auth_sessions (
 CREATE INDEX IF NOT EXISTS idx_auth_sessions_token
 ON auth_sessions(token_hash);
 
-
 CREATE INDEX IF NOT EXISTS idx_auth_sessions_user
 ON auth_sessions(user_id);
 
+CREATE INDEX IF NOT EXISTS idx_auth_sessions_expires
+ON auth_sessions(expires_at);
 
--- ============================================
+
+-- ============================================================
 -- GAME PROGRESS
--- ============================================
+-- ============================================================
 
 CREATE TABLE IF NOT EXISTS user_game_progress (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -112,13 +150,16 @@ CREATE TABLE IF NOT EXISTS user_game_progress (
 CREATE INDEX IF NOT EXISTS idx_game_progress_user
 ON user_game_progress(user_id);
 
+CREATE INDEX IF NOT EXISTS idx_game_progress_mode
+ON user_game_progress(mode);
 
--- ============================================
+
+-- ============================================================
 -- GAME SESSIONS
--- ============================================
+-- ============================================================
 
 CREATE TABLE IF NOT EXISTS game_sessions (
-    id UUID PRIMARY KEY,
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 
     user_id UUID NOT NULL
         REFERENCES users(id)
@@ -155,6 +196,10 @@ CREATE TABLE IF NOT EXISTS game_sessions (
         )
     ),
 
+    CHECK (level >= 1),
+
+    CHECK (reward_coins >= 0),
+
     CHECK (
         status IN (
             'started',
@@ -169,20 +214,25 @@ CREATE TABLE IF NOT EXISTS game_sessions (
 CREATE INDEX IF NOT EXISTS idx_game_sessions_user
 ON game_sessions(user_id);
 
+CREATE INDEX IF NOT EXISTS idx_game_sessions_user_created
+ON game_sessions(user_id, created_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_game_sessions_status
 ON game_sessions(status);
 
+CREATE INDEX IF NOT EXISTS idx_game_sessions_expires
+ON game_sessions(expires_at);
 
--- Only one active game per user.
+
+-- Only one active game session per user.
 CREATE UNIQUE INDEX IF NOT EXISTS one_active_game_per_user
 ON game_sessions(user_id)
 WHERE status = 'started';
 
 
--- ============================================
+-- ============================================================
 -- COIN TRANSACTIONS
--- ============================================
+-- ============================================================
 
 CREATE TABLE IF NOT EXISTS coin_transactions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -201,21 +251,28 @@ CREATE TABLE IF NOT EXISTS coin_transactions (
 
     description TEXT,
 
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    CHECK (balance_after >= 0)
 );
 
 
 CREATE INDEX IF NOT EXISTS idx_coin_transactions_user
 ON coin_transactions(user_id);
 
+CREATE INDEX IF NOT EXISTS idx_coin_transactions_user_created
+ON coin_transactions(user_id, created_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_coin_transactions_created
 ON coin_transactions(created_at);
 
+CREATE INDEX IF NOT EXISTS idx_coin_transactions_type
+ON coin_transactions(type);
 
--- ============================================
+
+-- ============================================================
 -- DAILY REWARDS
--- ============================================
+-- ============================================================
 
 CREATE TABLE IF NOT EXISTS daily_rewards (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -230,13 +287,22 @@ CREATE TABLE IF NOT EXISTS daily_rewards (
 
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
-    UNIQUE(user_id, reward_date)
+    UNIQUE(user_id, reward_date),
+
+    CHECK (reward_coins >= 0)
 );
 
 
--- ============================================
+CREATE INDEX IF NOT EXISTS idx_daily_rewards_user
+ON daily_rewards(user_id);
+
+CREATE INDEX IF NOT EXISTS idx_daily_rewards_date
+ON daily_rewards(reward_date);
+
+
+-- ============================================================
 -- AD REWARDS
--- ============================================
+-- ============================================================
 
 CREATE TABLE IF NOT EXISTS ad_rewards (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -257,17 +323,33 @@ CREATE TABLE IF NOT EXISTS ad_rewards (
 
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
-    UNIQUE(provider, provider_event_id)
+    UNIQUE(provider, provider_event_id),
+
+    CHECK (reward_amount >= 0),
+
+    CHECK (
+        status IN (
+            'completed',
+            'rejected',
+            'pending'
+        )
+    )
 );
 
 
 CREATE INDEX IF NOT EXISTS idx_ad_rewards_user
 ON ad_rewards(user_id);
 
+CREATE INDEX IF NOT EXISTS idx_ad_rewards_user_created
+ON ad_rewards(user_id, created_at DESC);
 
--- ============================================
+CREATE INDEX IF NOT EXISTS idx_ad_rewards_provider_event
+ON ad_rewards(provider, provider_event_id);
+
+
+-- ============================================================
 -- LUCKY SPINS
--- ============================================
+-- ============================================================
 
 CREATE TABLE IF NOT EXISTS lucky_spins (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -280,17 +362,22 @@ CREATE TABLE IF NOT EXISTS lucky_spins (
 
     reward_amount BIGINT NOT NULL,
 
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    CHECK (reward_amount >= 0)
 );
 
 
 CREATE INDEX IF NOT EXISTS idx_lucky_spins_user
 ON lucky_spins(user_id);
 
+CREATE INDEX IF NOT EXISTS idx_lucky_spins_created
+ON lucky_spins(created_at DESC);
 
--- ============================================
+
+-- ============================================================
 -- REFERRALS
--- ============================================
+-- ============================================================
 
 CREATE TABLE IF NOT EXISTS referrals (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -315,20 +402,30 @@ CREATE TABLE IF NOT EXISTS referrals (
 
     rewarded_at TIMESTAMPTZ,
 
-    UNIQUE(referred_user_id)
+    UNIQUE(referred_user_id),
+
+    CHECK (qualifying_coins >= 0),
+    CHECK (required_coins > 0),
+    CHECK (reward_coins >= 0)
 );
 
 
 CREATE INDEX IF NOT EXISTS idx_referrals_referrer
 ON referrals(referrer_id);
 
+CREATE INDEX IF NOT EXISTS idx_referrals_referred
+ON referrals(referred_user_id);
 
--- ============================================
+CREATE INDEX IF NOT EXISTS idx_referrals_rewarded
+ON referrals(rewarded);
+
+
+-- ============================================================
 -- WITHDRAWALS
--- ============================================
+-- ============================================================
 
 CREATE TABLE IF NOT EXISTS withdrawals (
-    id UUID PRIMARY KEY,
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 
     user_id UUID NOT NULL
         REFERENCES users(id)
@@ -358,6 +455,10 @@ CREATE TABLE IF NOT EXISTS withdrawals (
         )
     ),
 
+    CHECK (amount_coins > 0),
+
+    CHECK (amount_usd > 0),
+
     CHECK (
         status IN (
             'pending',
@@ -373,14 +474,19 @@ CREATE TABLE IF NOT EXISTS withdrawals (
 CREATE INDEX IF NOT EXISTS idx_withdrawals_user
 ON withdrawals(user_id);
 
+CREATE INDEX IF NOT EXISTS idx_withdrawals_user_created
+ON withdrawals(user_id, created_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_withdrawals_status
 ON withdrawals(status);
 
+CREATE INDEX IF NOT EXISTS idx_withdrawals_created
+ON withdrawals(created_at DESC);
 
--- ============================================
+
+-- ============================================================
 -- ACHIEVEMENTS
--- ============================================
+-- ============================================================
 
 CREATE TABLE IF NOT EXISTS user_achievements (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -401,17 +507,22 @@ CREATE TABLE IF NOT EXISTS user_achievements (
 
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
-    UNIQUE(user_id, achievement_key)
+    UNIQUE(user_id, achievement_key),
+
+    CHECK (progress >= 0)
 );
 
 
 CREATE INDEX IF NOT EXISTS idx_achievements_user
 ON user_achievements(user_id);
 
+CREATE INDEX IF NOT EXISTS idx_achievements_completed
+ON user_achievements(completed);
 
--- ============================================
+
+-- ============================================================
 -- HINT TRANSACTIONS
--- ============================================
+-- ============================================================
 
 CREATE TABLE IF NOT EXISTS hint_transactions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -424,17 +535,22 @@ CREATE TABLE IF NOT EXISTS hint_transactions (
 
     amount INTEGER NOT NULL DEFAULT 1,
 
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    CHECK (amount > 0)
 );
 
 
 CREATE INDEX IF NOT EXISTS idx_hint_transactions_user
 ON hint_transactions(user_id);
 
+CREATE INDEX IF NOT EXISTS idx_hint_transactions_created
+ON hint_transactions(created_at DESC);
 
--- ============================================
--- AUTO UPDATE updated_at
--- ============================================
+
+-- ============================================================
+-- AUTOMATIC updated_at FUNCTION
+-- ============================================================
 
 CREATE OR REPLACE FUNCTION update_updated_at_column()
 RETURNS TRIGGER AS $$
@@ -445,6 +561,10 @@ END;
 $$ LANGUAGE plpgsql;
 
 
+-- ============================================================
+-- USERS UPDATED_AT TRIGGER
+-- ============================================================
+
 DROP TRIGGER IF EXISTS users_updated_at
 ON users;
 
@@ -453,6 +573,10 @@ BEFORE UPDATE ON users
 FOR EACH ROW
 EXECUTE FUNCTION update_updated_at_column();
 
+
+-- ============================================================
+-- GAME PROGRESS UPDATED_AT TRIGGER
+-- ============================================================
 
 DROP TRIGGER IF EXISTS progress_updated_at
 ON user_game_progress;
@@ -463,6 +587,10 @@ FOR EACH ROW
 EXECUTE FUNCTION update_updated_at_column();
 
 
+-- ============================================================
+-- ACHIEVEMENTS UPDATED_AT TRIGGER
+-- ============================================================
+
 DROP TRIGGER IF EXISTS achievements_updated_at
 ON user_achievements;
 
@@ -472,8 +600,15 @@ FOR EACH ROW
 EXECUTE FUNCTION update_updated_at_column();
 
 
--- ============================================
--- ENABLE UUID GENERATION
--- ============================================
+-- ============================================================
+-- OPTIONAL CLEANUP INDEXES
+-- ============================================================
 
-CREATE EXTENSION IF NOT EXISTS pgcrypto;
+-- Helpful for finding expired sessions.
+CREATE INDEX IF NOT EXISTS idx_game_sessions_active_lookup
+ON game_sessions(user_id, status, expires_at);
+
+
+-- ============================================================
+-- SCHEMA COMPLETE
+-- ============================================================
