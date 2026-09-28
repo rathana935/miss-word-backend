@@ -12,12 +12,14 @@ export async function requireAuth(req, res, next) {
       });
     }
 
-    const token = authorization.slice(7).trim();
+    const token = authorization
+      .slice("Bearer ".length)
+      .trim();
 
-    if (!token) {
+    if (!token || token.length < 32 || token.length > 256) {
       return res.status(401).json({
         success: false,
-        message: "Authentication required"
+        message: "Invalid authentication token"
       });
     }
 
@@ -30,13 +32,51 @@ export async function requireAuth(req, res, next) {
       `
       SELECT
         s.id AS session_id,
+        s.user_id,
         s.expires_at,
-        u.*
+
+        u.id,
+        u.telegram_id,
+        u.username,
+        u.first_name,
+        u.last_name,
+        u.language_code,
+
+        u.coins,
+        u.lives,
+        u.hints,
+
+        u.last_life_at,
+
+        u.daily_bonus_claimed_at,
+        u.spin_claimed_at,
+
+        u.total_games,
+        u.total_ads,
+
+        u.life_ads_used,
+        u.life_ads_day,
+
+        u.hint_ads_used,
+        u.hint_ads_day,
+
+        u.referral_code,
+        u.referred_by,
+
+        u.successful_referrals,
+        u.referral_progress_coins,
+
+        u.created_at,
+        u.updated_at
+
       FROM auth_sessions s
-      JOIN users u
+
+      INNER JOIN users u
         ON u.id = s.user_id
+
       WHERE s.token_hash = $1
         AND s.expires_at > NOW()
+
       LIMIT 1
       `,
       [tokenHash]
@@ -45,23 +85,43 @@ export async function requireAuth(req, res, next) {
     if (!result.rows.length) {
       return res.status(401).json({
         success: false,
-        message: "Session expired"
+        message: "Session expired or invalid"
       });
     }
 
-    req.user = result.rows[0];
-    req.sessionId = result.rows[0].session_id;
+    const session = result.rows[0];
 
-    await pool.query(
-      `
-      UPDATE auth_sessions
-      SET last_used_at = NOW()
-      WHERE id = $1
-      `,
-      [req.sessionId]
-    );
+    /*
+     * Make authenticated identity available
+     * to every protected route.
+     */
+    req.user = session;
+    req.userId = session.user_id;
+    req.sessionId = session.session_id;
 
-    next();
+    /*
+     * Session activity is bookkeeping only.
+     * Do not turn a successful authentication
+     * into a 500 error because this update fails.
+     */
+    try {
+      await pool.query(
+        `
+        UPDATE auth_sessions
+        SET last_used_at = NOW()
+        WHERE id = $1
+        `,
+        [req.sessionId]
+      );
+    } catch (error) {
+      console.error(
+        "Failed to update auth session activity:",
+        error
+      );
+    }
+
+    return next();
+
   } catch (error) {
     console.error("requireAuth error:", error);
 
