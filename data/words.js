@@ -3,9 +3,7 @@
 | MISSING WORDS - WORD BANK
 |--------------------------------------------------------------------------
 |
-| 400+ words.
-|
-| Each mode gets its own section:
+| Exactly 400 words.
 |
 | EASY       -> levels 1-100
 | MEDIUM     -> levels 1-100
@@ -328,6 +326,19 @@ export const WORDS = [
   "SKILL",
   "STRATEGY",
 
+  // Additional Hard levels 91-100
+
+  "DISCOVERY",
+  "MOTIVATION",
+  "ADDITIONAL",
+  "DIRECTION",
+  "ADVENTUROUS",
+  "COMMUNICATION",
+  "OPERATION",
+  "PROTECTION",
+  "CREATION",
+  "DECISION",
+
 
   // ==========================================================
   // DIFFICULT 1-100
@@ -424,13 +435,26 @@ export const WORDS = [
   "WITHDRAWAL",
   "REWARD",
   "REFERRAL",
-  "ACHIEVEMENT",
   "TRANSACTION",
   "BALANCE",
   "PAYMENT",
   "ACCOUNT",
   "SECURITY",
-  "VERIFICATION"
+  "VERIFICATION",
+  "QUALIFICATION",
+
+  // Additional Difficult levels 91-100
+
+  "AUTHENTICATION",
+  "TRANSACTIONAL",
+  "CONFIGURATION",
+  "REGISTRATION",
+  "IDENTIFICATION",
+  "AUTHORIZATION",
+  "RESPONSIBILITY",
+  "ACHIEVEMENT",
+  "IMPLEMENTATION",
+  "TRANSFORMATION"
 ];
 
 
@@ -439,7 +463,7 @@ export const WORDS = [
 | MODE OFFSETS
 |--------------------------------------------------------------------------
 |
-| We intentionally use 100-word blocks.
+| Every mode has exactly 100 levels.
 |
 */
 
@@ -453,6 +477,65 @@ const MODE_OFFSETS = {
 
 /*
 |--------------------------------------------------------------------------
+| WORD BANK VALIDATION
+|--------------------------------------------------------------------------
+|
+| Fail early if the word bank is accidentally edited
+| and no longer contains exactly 400 entries.
+|--------------------------------------------------------------------------
+*/
+
+const EXPECTED_WORD_COUNT = 400;
+
+if (WORDS.length !== EXPECTED_WORD_COUNT) {
+  throw new Error(
+    `Invalid Missing Words word bank: expected ${EXPECTED_WORD_COUNT} words, found ${WORDS.length}`
+  );
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| MODE VALIDATION
+|--------------------------------------------------------------------------
+*/
+
+for (const [mode, offset] of Object.entries(MODE_OFFSETS)) {
+
+  const modeWords =
+    WORDS.slice(
+      offset,
+      offset + 100
+    );
+
+  if (modeWords.length !== 100) {
+    throw new Error(
+      `Invalid word bank for ${mode}: expected 100 words, found ${modeWords.length}`
+    );
+  }
+
+  for (
+    let index = 0;
+    index < modeWords.length;
+    index++
+  ) {
+    const word =
+      modeWords[index];
+
+    if (
+      typeof word !== "string" ||
+      !word.trim()
+    ) {
+      throw new Error(
+        `Invalid word at ${mode} level ${index + 1}`
+      );
+    }
+  }
+}
+
+
+/*
+|--------------------------------------------------------------------------
 | GET WORD FOR LEVEL
 |--------------------------------------------------------------------------
 */
@@ -461,16 +544,20 @@ export function getWordForLevel(
   mode,
   level
 ) {
+
   const normalizedMode =
     String(mode || "")
+      .trim()
       .toLowerCase();
+
 
   const numericLevel =
     Number(level);
 
 
   if (
-    !MODE_OFFSETS.hasOwnProperty(
+    !Object.prototype.hasOwnProperty.call(
+      MODE_OFFSETS,
       normalizedMode
     )
   ) {
@@ -503,7 +590,10 @@ export function getWordForLevel(
     WORDS[index];
 
 
-  if (!word) {
+  if (
+    typeof word !== "string" ||
+    !word.trim()
+  ) {
     throw new Error(
       `Word not found for ${normalizedMode} level ${numericLevel}`
     );
@@ -521,10 +611,13 @@ export function getWordForLevel(
 */
 
 export function getWordBankInfo() {
-  return {
-    totalWords: WORDS.length,
 
-    levelsPerMode: 100,
+  return {
+    totalWords:
+      WORDS.length,
+
+    levelsPerMode:
+      100,
 
     modes: [
       "easy",
