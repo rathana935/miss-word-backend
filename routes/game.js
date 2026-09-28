@@ -1,7 +1,14 @@
 import crypto from "crypto";
 import pool from "../db/pool.js";
-import { requireAuth } from "../middleware/requireAuth.js";
+import { requireAuth } from "../middleware/auth.js";
 import { getWordForLevel } from "../data/words.js";
+
+
+/*
+|--------------------------------------------------------------------------
+| GAME CONFIG
+|--------------------------------------------------------------------------
+*/
 
 const GAME_CONFIG = {
   easy: {
@@ -25,50 +32,102 @@ const GAME_CONFIG = {
   }
 };
 
+
+const MAX_LEVEL = 100;
+
 const MAX_LIVES = 5;
-const LIFE_MS = 60 * 60 * 1000;
-const GAME_TIMEOUT_MS = 15 * 60 * 1000;
+
+const LIFE_REGEN_MS =
+  60 * 60 * 1000;
+
+const GAME_TIMEOUT_MS =
+  15 * 60 * 1000;
+
+
+/*
+|--------------------------------------------------------------------------
+| HELPERS
+|--------------------------------------------------------------------------
+*/
+
 
 function createPuzzle(word, gaps) {
   const letters = word.split("");
 
-  const available = [];
+  /*
+   * Do not remove more positions than
+   * the word actually contains.
+   */
+  const gapCount = Math.min(
+    gaps,
+    letters.length
+  );
+
+  /*
+   * Prefer not to remove the first or last
+   * character when the word is long enough.
+   *
+   * This makes the puzzle more playable.
+   */
+  let available = [];
 
   for (let i = 0; i < letters.length; i++) {
-    available.push(i);
+    if (
+      letters.length > 2 &&
+      i !== 0 &&
+      i !== letters.length - 1
+    ) {
+      available.push(i);
+    }
+  }
+
+  /*
+   * Very short words may not have enough
+   * middle characters.
+   */
+  if (available.length < gapCount) {
+    available = [];
+
+    for (let i = 0; i < letters.length; i++) {
+      available.push(i);
+    }
   }
 
   const selected = [];
 
   while (
-    selected.length < Math.min(gaps, letters.length)
+    selected.length < gapCount &&
+    available.length > 0
   ) {
-    const random =
-      Math.floor(Math.random() * available.length);
+    const randomIndex = Math.floor(
+      Math.random() * available.length
+    );
 
     selected.push(
-      available.splice(random, 1)[0]
+      available.splice(randomIndex, 1)[0]
     );
   }
 
   selected.sort((a, b) => a - b);
 
-  const display = letters.map((letter, index) => {
-    if (selected.includes(index)) {
-      return "_";
-    }
+  const display = letters.map(
+    (letter, index) => {
+      if (selected.includes(index)) {
+        return "_";
+      }
 
-    return letter;
-  });
+      return letter;
+    }
+  );
 
   return {
     display: display.join(" "),
-    letters,
     gaps: selected
   };
 }
 
-function puzzleHash(word, puzzle) {
+
+function createPuzzleHash(word, puzzle) {
   return crypto
     .createHash("sha256")
     .update(
@@ -80,35 +139,32 @@ function puzzleHash(word, puzzle) {
     .digest("hex");
 }
 
-async function refillLives(userId) {
-  const result = await pool.query(
-    `
-    SELECT
-      id,
-      lives,
-      last_life_at
-    FROM users
-    WHERE id = $1
-    FOR UPDATE
-    `,
-    [userId]
-  );
 
-  if (!result.rows.length) {
-    throw new Error("User not found");
-  }
+/*
+|--------------------------------------------------------------------------
+| LIFE REGENERATION
+|--------------------------------------------------------------------------
+|
+| IMPORTANT:
+| This function expects the caller to already have
+| a transaction and row lock.
+|
+*/
 
-  const user = result.rows[0];
-
+async function regenerateLives(client, user) {
   if (user.lives >= MAX_LIVES) {
     return user;
   }
 
-  const last = new Date(user.last_life_at).getTime();
+  const lastLifeAt = new Date(
+    user.last_life_at
+  ).getTime();
+
   const now = Date.now();
 
   const recovered = Math.floor(
-    (now - last) / LIFE_MS
+    (now - lastLifeAt) /
+      LIFE_REGEN_MS
   );
 
   if (recovered <= 0) {
@@ -120,12 +176,22 @@ async function refillLives(userId) {
     user.lives + recovered
   );
 
-  const newLastLife =
+  /*
+   * If the player reaches max lives,
+   * restart the regeneration clock.
+   *
+   * Otherwise preserve the leftover
+   * regeneration time.
+   */
+  const newLastLifeAt =
     newLives >= MAX_LIVES
       ? new Date()
-      : new Date(last + recovered * LIFE_MS);
+      : new Date(
+          lastLifeAt +
+            recovered * LIFE_REGEN_MS
+        );
 
-  const updated = await pool.query(
+  const result = await client.query(
     `
     UPDATE users
     SET
@@ -134,566 +200,1004 @@ async function refillLives(userId) {
     WHERE id = $1
     RETURNING *
     `,
-    [userId, newLives, newLastLife]
+    [
+      user.id,
+      newLives,
+      newLastLifeAt
+    ]
   );
 
-  return updated.rows[0];
+  return result.rows[0];
 }
 
+
+/*
+|--------------------------------------------------------------------------
+| GAME ROUTES
+|--------------------------------------------------------------------------
+*/
+
 export function gameRoutes(app) {
-  /*
-   * GAME CONFIG
-   */
-  app.get("/api/game/config", requireAuth, async (req, res) => {
-    res.json({
-      success: true,
 
-      config: {
-        easy: GAME_CONFIG.easy,
-        medium: GAME_CONFIG.medium,
-        hard: GAME_CONFIG.hard,
-        difficult: GAME_CONFIG.difficult,
-
-        maxLives: MAX_LIVES,
-        lifeCooldownMinutes: 60,
-        gameTimeoutMinutes: 15,
-
-        levelsPerMode: 100
-      }
-    });
-  });
 
   /*
-   * PLAYER STATE
-   */
-  app.get("/api/game/state", requireAuth, async (req, res) => {
-    try {
-      const client = await pool.connect();
+  |--------------------------------------------------------------------------
+  | GAME CONFIG
+  |--------------------------------------------------------------------------
+  */
+
+  app.get(
+    "/api/game/config",
+    requireAuth,
+    async (req, res) => {
+      return res.json({
+        success: true,
+
+        config: {
+          easy: GAME_CONFIG.easy,
+          medium: GAME_CONFIG.medium,
+          hard: GAME_CONFIG.hard,
+          difficult: GAME_CONFIG.difficult,
+
+          maxLives: MAX_LIVES,
+
+          lifeCooldownMinutes: 60,
+
+          gameTimeoutMinutes: 15,
+
+          levelsPerMode: MAX_LEVEL
+        }
+      });
+    }
+  );
+
+
+  /*
+  |--------------------------------------------------------------------------
+  | PLAYER STATE
+  |--------------------------------------------------------------------------
+  */
+
+  app.get(
+    "/api/game/state",
+    requireAuth,
+    async (req, res) => {
+      const client =
+        await pool.connect();
 
       try {
         await client.query("BEGIN");
 
-        const user = await refillLives(req.user.id);
+        /*
+         * Lock the user while calculating
+         * regenerated lives.
+         */
+        const userResult =
+          await client.query(
+            `
+            SELECT *
+            FROM users
+            WHERE id = $1
+            FOR UPDATE
+            `,
+            [req.userId]
+          );
 
-        const progress = await client.query(
-          `
-          SELECT
-            mode,
-            current_level,
-            completed_levels
-          FROM user_game_progress
-          WHERE user_id = $1
-          ORDER BY
-            CASE mode
-              WHEN 'easy' THEN 1
-              WHEN 'medium' THEN 2
-              WHEN 'hard' THEN 3
-              WHEN 'difficult' THEN 4
-            END
-          `,
-          [req.user.id]
-        );
+        if (!userResult.rows.length) {
+          await client.query("ROLLBACK");
+
+          return res.status(404).json({
+            success: false,
+            message: "User not found"
+          });
+        }
+
+        let user =
+          userResult.rows[0];
+
+        user =
+          await regenerateLives(
+            client,
+            user
+          );
+
+
+        const progress =
+          await client.query(
+            `
+            SELECT
+              mode,
+              current_level,
+              completed_levels
+            FROM user_game_progress
+            WHERE user_id = $1
+            ORDER BY
+              CASE mode
+                WHEN 'easy' THEN 1
+                WHEN 'medium' THEN 2
+                WHEN 'hard' THEN 3
+                WHEN 'difficult' THEN 4
+              END
+            `,
+            [req.userId]
+          );
+
 
         await client.query("COMMIT");
 
-        res.json({
+
+        return res.json({
           success: true,
 
           user: {
-            coins: Number(user.coins),
-            lives: user.lives,
-            hints: user.hints,
-            totalGames: user.total_games,
-            totalAds: user.total_ads,
-            lastLifeAt: user.last_life_at
+            id: user.id,
+
+            telegramId:
+              user.telegram_id,
+
+            username:
+              user.username,
+
+            firstName:
+              user.first_name,
+
+            coins:
+              Number(user.coins),
+
+            lives:
+              user.lives,
+
+            hints:
+              user.hints,
+
+            totalGames:
+              user.total_games,
+
+            totalAds:
+              user.total_ads,
+
+            lastLifeAt:
+              user.last_life_at,
+
+            referralCode:
+              user.referral_code
           },
 
-          progress: progress.rows
+          progress:
+            progress.rows
         });
+
       } catch (error) {
-        await client.query("ROLLBACK");
-        throw error;
+        try {
+          await client.query("ROLLBACK");
+        } catch {}
+
+        console.error(
+          "GET /api/game/state:",
+          error
+        );
+
+        return res.status(500).json({
+          success: false,
+          message:
+            "Unable to load game state"
+        });
+
       } finally {
         client.release();
       }
-    } catch (error) {
-      console.error("Game state:", error);
-
-      res.status(500).json({
-        success: false,
-        message: "Unable to load game state"
-      });
     }
-  });
+  );
+
 
   /*
-   * START GAME
-   */
-  app.post("/api/game/start", requireAuth, async (req, res) => {
-    const mode = String(req.body?.mode || "").toLowerCase();
+  |--------------------------------------------------------------------------
+  | START GAME
+  |--------------------------------------------------------------------------
+  */
 
-    if (!GAME_CONFIG[mode]) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid game mode"
-      });
-    }
+  app.post(
+    "/api/game/start",
+    requireAuth,
+    async (req, res) => {
 
-    const client = await pool.connect();
+      const mode = String(
+        req.body?.mode || ""
+      ).toLowerCase();
 
-    try {
-      await client.query("BEGIN");
 
-      const lifeResult = await client.query(
-        `
-        SELECT *
-        FROM users
-        WHERE id = $1
-        FOR UPDATE
-        `,
-        [req.user.id]
-      );
-
-      if (!lifeResult.rows.length) {
-        await client.query("ROLLBACK");
-
-        return res.status(404).json({
+      if (!GAME_CONFIG[mode]) {
+        return res.status(400).json({
           success: false,
-          message: "User not found"
+          message:
+            "Invalid game mode"
         });
       }
 
-      let user = lifeResult.rows[0];
 
-      /*
-       * Refill lives.
-       */
-      if (user.lives < MAX_LIVES) {
-        const last = new Date(user.last_life_at).getTime();
-        const recovered = Math.floor(
-          (Date.now() - last) / LIFE_MS
-        );
+      const client =
+        await pool.connect();
 
-        if (recovered > 0) {
-          const newLives = Math.min(
-            MAX_LIVES,
-            user.lives + recovered
-          );
 
-          const newLast =
-            newLives >= MAX_LIVES
-              ? new Date()
-              : new Date(last + recovered * LIFE_MS);
+      try {
+        await client.query("BEGIN");
 
-          const updated = await client.query(
+
+        /*
+         * Lock the user row.
+         *
+         * This prevents two simultaneous
+         * start requests from both consuming
+         * the same life.
+         */
+        const userResult =
+          await client.query(
             `
-            UPDATE users
-            SET
-              lives = $2,
-              last_life_at = $3
+            SELECT *
+            FROM users
             WHERE id = $1
-            RETURNING *
+            FOR UPDATE
             `,
-            [user.id, newLives, newLast]
+            [req.userId]
           );
 
-          user = updated.rows[0];
+
+        if (!userResult.rows.length) {
+          await client.query("ROLLBACK");
+
+          return res.status(404).json({
+            success: false,
+            message:
+              "User not found"
+          });
         }
-      }
 
-      /*
-       * Prevent multiple active games.
-       *
-       * If an old game exists but has expired,
-       * mark it expired first.
-       */
-      await client.query(
-        `
-        UPDATE game_sessions
-        SET status = 'expired'
-        WHERE user_id = $1
-          AND status = 'started'
-          AND expires_at <= NOW()
-        `,
-        [user.id]
-      );
 
-      const active = await client.query(
-        `
-        SELECT id
-        FROM game_sessions
-        WHERE user_id = $1
-          AND status = 'started'
-          AND expires_at > NOW()
-        LIMIT 1
-        `,
-        [user.id]
-      );
+        let user =
+          userResult.rows[0];
 
-      if (active.rows.length) {
-        await client.query("ROLLBACK");
 
-        return res.status(409).json({
-          success: false,
-          message: "You already have an active game",
-          sessionId: active.rows[0].id
-        });
-      }
+        /*
+         * Regenerate lives first.
+         */
+        user =
+          await regenerateLives(
+            client,
+            user
+          );
 
-      if (user.lives <= 0) {
-        await client.query("ROLLBACK");
 
-        return res.status(400).json({
-          success: false,
-          message: "No lives available",
-          lives: 0
-        });
-      }
-
-      const progress = await client.query(
-        `
-        SELECT *
-        FROM user_game_progress
-        WHERE user_id = $1
-          AND mode = $2
-        FOR UPDATE
-        `,
-        [user.id, mode]
-      );
-
-      let level = 1;
-
-      if (progress.rows.length) {
-        level = progress.rows[0].current_level;
-      }
-
-      if (level > 100) {
-        await client.query("ROLLBACK");
-
-        return res.status(400).json({
-          success: false,
-          message: "All levels completed"
-        });
-      }
-
-      const word = getWordForLevel(mode, level);
-
-      const puzzle = createPuzzle(
-        word,
-        GAME_CONFIG[mode].gaps
-      );
-
-      const hash = puzzleHash(word, puzzle);
-
-      const sessionId = crypto.randomUUID();
-
-      const expiresAt = new Date(
-        Date.now() + GAME_TIMEOUT_MS
-      );
-
-      await client.query(
-        `
-        INSERT INTO game_sessions (
-          id,
-          user_id,
-          mode,
-          level,
-          word,
-          puzzle,
-          puzzle_hash,
-          reward_coins,
-          expires_at,
-          status
-        )
-        VALUES (
-          $1,
-          $2,
-          $3,
-          $4,
-          $5,
-          $6,
-          $7,
-          $8,
-          $9,
-          'started'
-        )
-        `,
-        [
-          sessionId,
-          user.id,
-          mode,
-          level,
-          word,
-          JSON.stringify(puzzle),
-          hash,
-          GAME_CONFIG[mode].reward,
-          expiresAt
-        ]
-      );
-
-      /*
-       * Consume one life.
-       */
-      const updatedUser = await client.query(
-        `
-        UPDATE users
-        SET
-          lives = lives - 1,
-          last_life_at =
-            CASE
-              WHEN lives - 1 < $2
-              THEN NOW()
-              ELSE last_life_at
-            END
-        WHERE id = $1
-        RETURNING *
-        `,
-        [user.id, MAX_LIVES]
-      );
-
-      await client.query("COMMIT");
-
-      res.json({
-        success: true,
-
-        game: {
-          sessionId,
-          mode,
-          level,
-
-          puzzle: {
-            display: puzzle.display,
-            gaps: puzzle.gaps.length
-          },
-
-          reward: GAME_CONFIG[mode].reward,
-
-          expiresAt
-        },
-
-        user: {
-          coins: Number(updatedUser.rows[0].coins),
-          lives: updatedUser.rows[0].lives
-        }
-      });
-    } catch (error) {
-      await client.query("ROLLBACK");
-
-      console.error("Start game:", error);
-
-      res.status(500).json({
-        success: false,
-        message: "Unable to start game"
-      });
-    } finally {
-      client.release();
-    }
-  });
-
-  /*
-   * SUBMIT GAME
-   */
-  app.post("/api/game/submit", requireAuth, async (req, res) => {
-    const sessionId = req.body?.sessionId;
-    const answer = String(req.body?.answer || "")
-      .trim()
-      .toUpperCase();
-
-    if (!sessionId || !answer) {
-      return res.status(400).json({
-        success: false,
-        message: "Session ID and answer are required"
-      });
-    }
-
-    const client = await pool.connect();
-
-    try {
-      await client.query("BEGIN");
-
-      const sessionResult = await client.query(
-        `
-        SELECT *
-        FROM game_sessions
-        WHERE id = $1
-          AND user_id = $2
-        FOR UPDATE
-        `,
-        [sessionId, req.user.id]
-      );
-
-      if (!sessionResult.rows.length) {
-        await client.query("ROLLBACK");
-
-        return res.status(404).json({
-          success: false,
-          message: "Game session not found"
-        });
-      }
-
-      const session = sessionResult.rows[0];
-
-      if (session.status !== "started") {
-        await client.query("ROLLBACK");
-
-        return res.status(400).json({
-          success: false,
-          message: "This game is no longer active"
-        });
-      }
-
-      if (new Date(session.expires_at).getTime() < Date.now()) {
+        /*
+         * Expire old games.
+         */
         await client.query(
           `
           UPDATE game_sessions
           SET status = 'expired'
-          WHERE id = $1
+          WHERE user_id = $1
+            AND status = 'started'
+            AND expires_at <= NOW()
           `,
-          [sessionId]
+          [user.id]
         );
+
+
+        /*
+         * Check for another active game.
+         */
+        const active =
+          await client.query(
+            `
+            SELECT id
+            FROM game_sessions
+            WHERE user_id = $1
+              AND status = 'started'
+              AND expires_at > NOW()
+            LIMIT 1
+            `,
+            [user.id]
+          );
+
+
+        if (active.rows.length) {
+          await client.query("ROLLBACK");
+
+          return res.status(409).json({
+            success: false,
+            message:
+              "You already have an active game",
+
+            sessionId:
+              active.rows[0].id
+          });
+        }
+
+
+        /*
+         * Check lives.
+         */
+        if (user.lives <= 0) {
+          await client.query("ROLLBACK");
+
+          return res.status(400).json({
+            success: false,
+            message:
+              "No lives available",
+
+            lives: 0,
+
+            nextLifeAt:
+              new Date(
+                new Date(
+                  user.last_life_at
+                ).getTime() +
+                  LIFE_REGEN_MS
+              )
+          });
+        }
+
+
+        /*
+         * Get player's current level.
+         */
+        const progressResult =
+          await client.query(
+            `
+            SELECT *
+            FROM user_game_progress
+            WHERE user_id = $1
+              AND mode = $2
+            FOR UPDATE
+            `,
+            [
+              user.id,
+              mode
+            ]
+          );
+
+
+        let level = 1;
+
+
+        if (
+          progressResult.rows.length
+        ) {
+          level =
+            progressResult.rows[0]
+              .current_level;
+        } else {
+
+          /*
+           * Normally auth creates this,
+           * but create it safely if missing.
+           */
+          await client.query(
+            `
+            INSERT INTO user_game_progress (
+              user_id,
+              mode,
+              current_level,
+              completed_levels
+            )
+            VALUES (
+              $1,
+              $2,
+              1,
+              0
+            )
+            ON CONFLICT (user_id, mode)
+            DO NOTHING
+            `,
+            [
+              user.id,
+              mode
+            ]
+          );
+
+          level = 1;
+        }
+
+
+        if (level > MAX_LEVEL) {
+          await client.query("ROLLBACK");
+
+          return res.status(400).json({
+            success: false,
+            message:
+              "All levels completed"
+          });
+        }
+
+
+        /*
+         * Get the server-side word.
+         */
+        const word =
+          getWordForLevel(
+            mode,
+            level
+          );
+
+
+        if (
+          typeof word !== "string" ||
+          !word.trim()
+        ) {
+          throw new Error(
+            `No word configured for ${mode} level ${level}`
+          );
+        }
+
+
+        const puzzle =
+          createPuzzle(
+            word,
+            GAME_CONFIG[mode].gaps
+          );
+
+
+        const hash =
+          createPuzzleHash(
+            word,
+            puzzle
+          );
+
+
+        const sessionId =
+          crypto.randomUUID();
+
+
+        const expiresAt =
+          new Date(
+            Date.now() +
+              GAME_TIMEOUT_MS
+          );
+
+
+        /*
+         * Store the authoritative puzzle.
+         */
+        await client.query(
+          `
+          INSERT INTO game_sessions (
+            id,
+            user_id,
+            mode,
+            level,
+            word,
+            puzzle,
+            puzzle_hash,
+            reward_coins,
+            expires_at,
+            status
+          )
+          VALUES (
+            $1,
+            $2,
+            $3,
+            $4,
+            $5,
+            $6,
+            $7,
+            $8,
+            $9,
+            'started'
+          )
+          `,
+          [
+            sessionId,
+            user.id,
+            mode,
+            level,
+            word,
+            JSON.stringify(puzzle),
+            hash,
+            GAME_CONFIG[mode].reward,
+            expiresAt
+          ]
+        );
+
+
+        /*
+         * Consume one life.
+         */
+        const updatedUser =
+          await client.query(
+            `
+            UPDATE users
+            SET
+              lives = lives - 1,
+
+              /*
+               * When dropping below max,
+               * NOW() becomes the start of the
+               * next regeneration cycle.
+               */
+              last_life_at =
+                CASE
+                  WHEN lives = $2
+                  THEN NOW()
+                  ELSE last_life_at
+                END
+
+            WHERE id = $1
+
+            RETURNING *
+            `,
+            [
+              user.id,
+              MAX_LIVES
+            ]
+          );
+
 
         await client.query("COMMIT");
 
-        return res.status(400).json({
-          success: false,
-          message: "Game expired"
-        });
-      }
 
-      const correct = answer === session.word;
+        const finalUser =
+          updatedUser.rows[0];
 
-      if (!correct) {
-        await client.query("ROLLBACK");
 
         return res.json({
           success: true,
-          correct: false,
-          message: "Wrong answer"
+
+          game: {
+            sessionId,
+
+            mode,
+
+            level,
+
+            puzzle: {
+              display:
+                puzzle.display,
+
+              gaps:
+                puzzle.gaps.length
+            },
+
+            reward:
+              GAME_CONFIG[mode]
+                .reward,
+
+            expiresAt
+          },
+
+          user: {
+            coins:
+              Number(
+                finalUser.coins
+              ),
+
+            lives:
+              finalUser.lives,
+
+            hints:
+              finalUser.hints
+          }
+        });
+
+      } catch (error) {
+
+        try {
+          await client.query(
+            "ROLLBACK"
+          );
+        } catch {}
+
+        /*
+         * PostgreSQL unique-index race:
+         * one_active_game_per_user
+         */
+        if (
+          error.code === "23505" &&
+          error.constraint ===
+            "one_active_game_per_user"
+        ) {
+          return res.status(409).json({
+            success: false,
+            message:
+              "You already have an active game"
+          });
+        }
+
+
+        console.error(
+          "POST /api/game/start:",
+          error
+        );
+
+
+        return res.status(500).json({
+          success: false,
+          message:
+            "Unable to start game"
+        });
+
+      } finally {
+        client.release();
+      }
+    }
+  );
+
+
+  /*
+  |--------------------------------------------------------------------------
+  | SUBMIT GAME
+  |--------------------------------------------------------------------------
+  */
+
+  app.post(
+    "/api/game/submit",
+    requireAuth,
+    async (req, res) => {
+
+      const sessionId =
+        String(
+          req.body?.sessionId || ""
+        ).trim();
+
+
+      const answer =
+        String(
+          req.body?.answer || ""
+        )
+          .trim()
+          .toUpperCase();
+
+
+      if (!sessionId || !answer) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Session ID and answer are required"
         });
       }
 
-      const reward = Number(session.reward_coins);
 
-      const updated = await client.query(
-        `
-        UPDATE users
-        SET
-          coins = coins + $2,
-          total_games = total_games + 1
-        WHERE id = $1
-        RETURNING *
-        `,
-        [req.user.id, reward]
-      );
+      const client =
+        await pool.connect();
 
-      const user = updated.rows[0];
 
-      await client.query(
-        `
-        INSERT INTO coin_transactions (
-          user_id,
-          amount,
-          balance_after,
-          type,
-          reference_id,
-          description
-        )
-        VALUES (
-          $1,
-          $2,
-          $3,
-          'game_reward',
-          $4,
-          $5
-        )
-        `,
-        [
-          user.id,
-          reward,
-          user.coins,
-          session.id,
-          `${session.mode} level ${session.level}`
-        ]
-      );
+      try {
+        await client.query("BEGIN");
 
-      await client.query(
-        `
-        UPDATE game_sessions
-        SET
-          status = 'completed',
-          completed_at = NOW(),
-          completion_token = $2
-        WHERE id = $1
-        `,
-        [
-          sessionId,
-          crypto.randomBytes(24).toString("hex")
-        ]
-      );
 
-      await client.query(
-        `
-        INSERT INTO user_game_progress (
-          user_id,
-          mode,
-          current_level,
-          completed_levels
-        )
-        VALUES (
-          $1,
-          $2,
-          2,
-          1
-        )
-        ON CONFLICT (user_id, mode)
-        DO UPDATE SET
-          completed_levels =
-            LEAST(100, user_game_progress.completed_levels + 1),
+        /*
+         * Lock the game session.
+         */
+        const sessionResult =
+          await client.query(
+            `
+            SELECT *
+            FROM game_sessions
+            WHERE id = $1
+              AND user_id = $2
+            FOR UPDATE
+            `,
+            [
+              sessionId,
+              req.userId
+            ]
+          );
 
-          current_level =
-            LEAST(100,
+
+        if (!sessionResult.rows.length) {
+          await client.query("ROLLBACK");
+
+          return res.status(404).json({
+            success: false,
+            message:
+              "Game session not found"
+          });
+        }
+
+
+        const session =
+          sessionResult.rows[0];
+
+
+        /*
+         * Already completed/expired.
+         */
+        if (
+          session.status !== "started"
+        ) {
+          await client.query("ROLLBACK");
+
+          return res.status(400).json({
+            success: false,
+            message:
+              "This game is no longer active"
+          });
+        }
+
+
+        /*
+         * Check expiration.
+         */
+        if (
+          new Date(
+            session.expires_at
+          ).getTime() <= Date.now()
+        ) {
+
+          await client.query(
+            `
+            UPDATE game_sessions
+            SET status = 'expired'
+            WHERE id = $1
+            `,
+            [sessionId]
+          );
+
+
+          await client.query(
+            "COMMIT"
+          );
+
+
+          return res.status(400).json({
+            success: false,
+            message:
+              "Game expired"
+          });
+        }
+
+
+        /*
+         * Normalize the server answer.
+         */
+        const correctAnswer =
+          String(session.word)
+            .trim()
+            .toUpperCase();
+
+
+        const correct =
+          answer === correctAnswer;
+
+
+        /*
+         * Wrong answer does NOT award coins.
+         *
+         * The game remains active so the player
+         * can try again.
+         */
+        if (!correct) {
+
+          await client.query(
+            "ROLLBACK"
+          );
+
+          return res.json({
+            success: true,
+
+            correct: false,
+
+            reward: 0,
+
+            message:
+              "Wrong answer"
+          });
+        }
+
+
+        /*
+         * SERVER-CALCULATED REWARD
+         */
+        const reward =
+          Number(
+            session.reward_coins
+          );
+
+
+        /*
+         * Update coins and total games.
+         */
+        const userResult =
+          await client.query(
+            `
+            UPDATE users
+            SET
+              coins = coins + $2,
+              total_games = total_games + 1
+            WHERE id = $1
+            RETURNING *
+            `,
+            [
+              req.userId,
+              reward
+            ]
+          );
+
+
+        if (!userResult.rows.length) {
+          throw new Error(
+            "User disappeared during game completion"
+          );
+        }
+
+
+        const user =
+          userResult.rows[0];
+
+
+        /*
+         * Record the coin transaction.
+         */
+        await client.query(
+          `
+          INSERT INTO coin_transactions (
+            user_id,
+            amount,
+            balance_after,
+            type,
+            reference_id,
+            description
+          )
+          VALUES (
+            $1,
+            $2,
+            $3,
+            $4,
+            $5,
+            $6
+          )
+          `,
+          [
+            user.id,
+
+            reward,
+
+            user.coins,
+
+            "game_reward",
+
+            session.id,
+
+            `${session.mode} level ${session.level}`
+          ]
+        );
+
+
+        /*
+         * Mark the game completed.
+         */
+        await client.query(
+          `
+          UPDATE game_sessions
+          SET
+            status = 'completed',
+            completed_at = NOW(),
+            completion_token = $2
+          WHERE id = $1
+          `,
+          [
+            session.id,
+
+            crypto
+              .randomBytes(24)
+              .toString("hex")
+          ]
+        );
+
+
+        /*
+         * Advance the player's level.
+         */
+        await client.query(
+          `
+          INSERT INTO user_game_progress (
+            user_id,
+            mode,
+            current_level,
+            completed_levels
+          )
+          VALUES (
+            $1,
+            $2,
+            CASE
+              WHEN $3 >= $4
+              THEN $4
+              ELSE $3 + 1
+            END,
+            1
+          )
+
+          ON CONFLICT (user_id, mode)
+
+          DO UPDATE SET
+
+            completed_levels =
+              LEAST(
+                $4,
+                user_game_progress.completed_levels + 1
+              ),
+
+            current_level =
               CASE
-                WHEN user_game_progress.current_level >= 100
-                THEN 100
+                WHEN user_game_progress.current_level >= $4
+                THEN $4
                 ELSE user_game_progress.current_level + 1
               END
-            )
-        `,
-        [user.id, session.mode]
-      );
+          `,
+          [
+            user.id,
+            session.mode,
+            session.level,
+            MAX_LEVEL
+          ]
+        );
 
-      await client.query("COMMIT");
 
-      res.json({
-        success: true,
+        await client.query(
+          "COMMIT"
+        );
 
-        correct: true,
 
-        reward,
+        return res.json({
+          success: true,
 
-        user: {
-          coins: Number(user.coins),
-          lives: user.lives,
-          totalGames: user.total_games
-        },
+          correct: true,
 
-        game: {
-          mode: session.mode,
-          level: session.level,
-          completed: true
-        }
-      });
-    } catch (error) {
-      await client.query("ROLLBACK");
+          reward,
 
-      console.error("Submit game:", error);
+          user: {
+            coins:
+              Number(user.coins),
 
-      res.status(500).json({
-        success: false,
-        message: "Unable to submit game"
-      });
-    } finally {
-      client.release();
+            lives:
+              user.lives,
+
+            hints:
+              user.hints,
+
+            totalGames:
+              user.total_games
+          },
+
+          game: {
+            mode:
+              session.mode,
+
+            level:
+              session.level,
+
+            completed: true,
+
+            nextLevel:
+              Math.min(
+                MAX_LEVEL,
+                Number(session.level) + 1
+              )
+          }
+        });
+
+      } catch (error) {
+
+        try {
+          await client.query(
+            "ROLLBACK"
+          );
+        } catch {}
+
+
+        console.error(
+          "POST /api/game/submit:",
+          error
+        );
+
+
+        return res.status(500).json({
+          success: false,
+          message:
+            "Unable to submit game"
+        });
+
+      } finally {
+        client.release();
+      }
     }
-  });
+  );
 }
