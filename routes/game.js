@@ -1,7 +1,9 @@
 import crypto from "crypto";
 import pool from "../db/pool.js";
+
 import { requireAuth } from "../middleware/auth.js";
 import { getWordForLevel } from "../data/words.js";
+import { processReferralProgress } from "./referrals.js";
 
 
 /*
@@ -38,10 +40,10 @@ const MAX_LEVEL = 100;
 const MAX_LIVES = 5;
 
 const LIFE_REGEN_MS =
-  60 * 60 * 1000;
+  60 * 60 * 1000; // 60 minutes
 
 const GAME_TIMEOUT_MS =
-  15 * 60 * 1000;
+  15 * 60 * 1000; // 15 minutes
 
 
 /*
@@ -51,39 +53,34 @@ const GAME_TIMEOUT_MS =
 */
 
 
+/**
+ * Create the missing-letter puzzle.
+ *
+ * The actual word and missing positions are generated
+ * only on the server.
+ */
 function createPuzzle(word, gaps) {
   const letters = word.split("");
 
-  /*
-   * Do not remove more positions than
-   * the word actually contains.
-   */
   const gapCount = Math.min(
-    gaps,
+    Number(gaps),
     letters.length
   );
 
-  /*
-   * Prefer not to remove the first or last
-   * character when the word is long enough.
-   *
-   * This makes the puzzle more playable.
-   */
   let available = [];
 
-  for (let i = 0; i < letters.length; i++) {
-    if (
-      letters.length > 2 &&
-      i !== 0 &&
-      i !== letters.length - 1
-    ) {
+  /*
+   * Prefer middle characters so that the first
+   * and last characters remain visible when possible.
+   */
+  if (letters.length > 2) {
+    for (let i = 1; i < letters.length - 1; i++) {
       available.push(i);
     }
   }
 
   /*
-   * Very short words may not have enough
-   * middle characters.
+   * Short words may not have enough middle positions.
    */
   if (available.length < gapCount) {
     available = [];
@@ -99,8 +96,9 @@ function createPuzzle(word, gaps) {
     selected.length < gapCount &&
     available.length > 0
   ) {
-    const randomIndex = Math.floor(
-      Math.random() * available.length
+    const randomIndex = crypto.randomInt(
+      0,
+      available.length
     );
 
     selected.push(
@@ -110,9 +108,12 @@ function createPuzzle(word, gaps) {
 
   selected.sort((a, b) => a - b);
 
+  const selectedSet =
+    new Set(selected);
+
   const display = letters.map(
     (letter, index) => {
-      if (selected.includes(index)) {
+      if (selectedSet.has(index)) {
         return "_";
       }
 
@@ -127,6 +128,9 @@ function createPuzzle(word, gaps) {
 }
 
 
+/**
+ * Hash the authoritative puzzle.
+ */
 function createPuzzleHash(word, puzzle) {
   return crypto
     .createHash("sha256")
@@ -140,72 +144,81 @@ function createPuzzleHash(word, puzzle) {
 }
 
 
-/*
-|--------------------------------------------------------------------------
-| LIFE REGENERATION
-|--------------------------------------------------------------------------
-|
-| IMPORTANT:
-| This function expects the caller to already have
-| a transaction and row lock.
-|
-*/
-
+/**
+ * Regenerate lives.
+ *
+ * IMPORTANT:
+ * The caller must already have a transaction
+ * and a FOR UPDATE lock on the user row.
+ */
 async function regenerateLives(client, user) {
-  if (user.lives >= MAX_LIVES) {
+  const currentLives =
+    Number(user.lives);
+
+  if (currentLives >= MAX_LIVES) {
     return user;
   }
 
-  const lastLifeAt = new Date(
-    user.last_life_at
-  ).getTime();
+  const lastLifeTimestamp =
+    new Date(user.last_life_at).getTime();
 
-  const now = Date.now();
+  const now =
+    Date.now();
 
-  const recovered = Math.floor(
-    (now - lastLifeAt) /
-      LIFE_REGEN_MS
-  );
+  /*
+   * Safety fallback if last_life_at is invalid.
+   */
+  if (!Number.isFinite(lastLifeTimestamp)) {
+    return user;
+  }
+
+  const recovered =
+    Math.floor(
+      (now - lastLifeTimestamp) /
+        LIFE_REGEN_MS
+    );
 
   if (recovered <= 0) {
     return user;
   }
 
-  const newLives = Math.min(
-    MAX_LIVES,
-    user.lives + recovered
-  );
+  const newLives =
+    Math.min(
+      MAX_LIVES,
+      currentLives + recovered
+    );
 
   /*
-   * If the player reaches max lives,
-   * restart the regeneration clock.
+   * Preserve leftover regeneration time
+   * when the player has not reached max lives.
    *
-   * Otherwise preserve the leftover
-   * regeneration time.
+   * If max lives are reached, restart the
+   * timer from now.
    */
   const newLastLifeAt =
     newLives >= MAX_LIVES
-      ? new Date()
+      ? new Date(now)
       : new Date(
-          lastLifeAt +
+          lastLifeTimestamp +
             recovered * LIFE_REGEN_MS
         );
 
-  const result = await client.query(
-    `
-    UPDATE users
-    SET
-      lives = $2,
-      last_life_at = $3
-    WHERE id = $1
-    RETURNING *
-    `,
-    [
-      user.id,
-      newLives,
-      newLastLifeAt
-    ]
-  );
+  const result =
+    await client.query(
+      `
+      UPDATE users
+      SET
+        lives = $2,
+        last_life_at = $3
+      WHERE id = $1
+      RETURNING *
+      `,
+      [
+        user.id,
+        newLives,
+        newLastLifeAt
+      ]
+    );
 
   return result.rows[0];
 }
@@ -239,13 +252,17 @@ export function gameRoutes(app) {
           hard: GAME_CONFIG.hard,
           difficult: GAME_CONFIG.difficult,
 
-          maxLives: MAX_LIVES,
+          maxLives:
+            MAX_LIVES,
 
-          lifeCooldownMinutes: 60,
+          lifeCooldownMinutes:
+            60,
 
-          gameTimeoutMinutes: 15,
+          gameTimeoutMinutes:
+            15,
 
-          levelsPerMode: MAX_LEVEL
+          levelsPerMode:
+            MAX_LEVEL
         }
       });
     }
@@ -268,8 +285,9 @@ export function gameRoutes(app) {
       try {
         await client.query("BEGIN");
 
+
         /*
-         * Lock the user while calculating
+         * Lock user while calculating
          * regenerated lives.
          */
         const userResult =
@@ -283,17 +301,23 @@ export function gameRoutes(app) {
             [req.userId]
           );
 
+
         if (!userResult.rows.length) {
-          await client.query("ROLLBACK");
+          await client.query(
+            "ROLLBACK"
+          );
 
           return res.status(404).json({
             success: false,
-            message: "User not found"
+            message:
+              "User not found"
           });
         }
 
+
         let user =
           userResult.rows[0];
+
 
         user =
           await regenerateLives(
@@ -302,7 +326,10 @@ export function gameRoutes(app) {
           );
 
 
-        const progress =
+        /*
+         * Get progress for every mode.
+         */
+        const progressResult =
           await client.query(
             `
             SELECT
@@ -317,20 +344,24 @@ export function gameRoutes(app) {
                 WHEN 'medium' THEN 2
                 WHEN 'hard' THEN 3
                 WHEN 'difficult' THEN 4
+                ELSE 99
               END
             `,
             [req.userId]
           );
 
 
-        await client.query("COMMIT");
+        await client.query(
+          "COMMIT"
+        );
 
 
         return res.json({
           success: true,
 
           user: {
-            id: user.id,
+            id:
+              user.id,
 
             telegramId:
               user.telegram_id,
@@ -345,16 +376,16 @@ export function gameRoutes(app) {
               Number(user.coins),
 
             lives:
-              user.lives,
+              Number(user.lives),
 
             hints:
-              user.hints,
+              Number(user.hints),
 
             totalGames:
-              user.total_games,
+              Number(user.total_games),
 
             totalAds:
-              user.total_ads,
+              Number(user.total_ads),
 
             lastLifeAt:
               user.last_life_at,
@@ -364,12 +395,30 @@ export function gameRoutes(app) {
           },
 
           progress:
-            progress.rows
+            progressResult.rows.map(
+              row => ({
+                mode:
+                  row.mode,
+
+                currentLevel:
+                  Number(
+                    row.current_level
+                  ),
+
+                completedLevels:
+                  Number(
+                    row.completed_levels
+                  )
+              })
+            )
         });
 
       } catch (error) {
+
         try {
-          await client.query("ROLLBACK");
+          await client.query(
+            "ROLLBACK"
+          );
         } catch {}
 
         console.error(
@@ -401,9 +450,12 @@ export function gameRoutes(app) {
     requireAuth,
     async (req, res) => {
 
-      const mode = String(
-        req.body?.mode || ""
-      ).toLowerCase();
+      const mode =
+        String(
+          req.body?.mode || ""
+        )
+          .trim()
+          .toLowerCase();
 
 
       if (!GAME_CONFIG[mode]) {
@@ -420,15 +472,16 @@ export function gameRoutes(app) {
 
 
       try {
-        await client.query("BEGIN");
+        await client.query(
+          "BEGIN"
+        );
 
 
         /*
-         * Lock the user row.
+         * Lock user.
          *
          * This prevents two simultaneous
-         * start requests from both consuming
-         * the same life.
+         * requests from spending the same life.
          */
         const userResult =
           await client.query(
@@ -443,7 +496,9 @@ export function gameRoutes(app) {
 
 
         if (!userResult.rows.length) {
-          await client.query("ROLLBACK");
+          await client.query(
+            "ROLLBACK"
+          );
 
           return res.status(404).json({
             success: false,
@@ -458,7 +513,8 @@ export function gameRoutes(app) {
 
 
         /*
-         * Regenerate lives first.
+         * Regenerate lives before
+         * checking the available balance.
          */
         user =
           await regenerateLives(
@@ -468,12 +524,13 @@ export function gameRoutes(app) {
 
 
         /*
-         * Expire old games.
+         * Expire old sessions.
          */
         await client.query(
           `
           UPDATE game_sessions
-          SET status = 'expired'
+          SET
+            status = 'expired'
           WHERE user_id = $1
             AND status = 'started'
             AND expires_at <= NOW()
@@ -483,9 +540,10 @@ export function gameRoutes(app) {
 
 
         /*
-         * Check for another active game.
+         * Check whether the player
+         * already has an active game.
          */
-        const active =
+        const activeResult =
           await client.query(
             `
             SELECT id
@@ -499,16 +557,19 @@ export function gameRoutes(app) {
           );
 
 
-        if (active.rows.length) {
-          await client.query("ROLLBACK");
+        if (activeResult.rows.length) {
+          await client.query(
+            "ROLLBACK"
+          );
 
           return res.status(409).json({
             success: false,
+
             message:
               "You already have an active game",
 
             sessionId:
-              active.rows[0].id
+              activeResult.rows[0].id
           });
         }
 
@@ -516,34 +577,44 @@ export function gameRoutes(app) {
         /*
          * Check lives.
          */
-        if (user.lives <= 0) {
-          await client.query("ROLLBACK");
+        if (
+          Number(user.lives) <= 0
+        ) {
+
+          const nextLifeAt =
+            new Date(
+              new Date(
+                user.last_life_at
+              ).getTime() +
+                LIFE_REGEN_MS
+            );
+
+          await client.query(
+            "ROLLBACK"
+          );
 
           return res.status(400).json({
             success: false,
+
             message:
               "No lives available",
 
             lives: 0,
 
-            nextLifeAt:
-              new Date(
-                new Date(
-                  user.last_life_at
-                ).getTime() +
-                  LIFE_REGEN_MS
-              )
+            nextLifeAt
           });
         }
 
 
         /*
-         * Get player's current level.
+         * Get current level.
          */
         const progressResult =
           await client.query(
             `
-            SELECT *
+            SELECT
+              current_level,
+              completed_levels
             FROM user_game_progress
             WHERE user_id = $1
               AND mode = $2
@@ -559,17 +630,20 @@ export function gameRoutes(app) {
         let level = 1;
 
 
-        if (
-          progressResult.rows.length
-        ) {
+        if (progressResult.rows.length) {
+
           level =
-            progressResult.rows[0]
-              .current_level;
+            Number(
+              progressResult.rows[0]
+                .current_level
+            );
+
         } else {
 
           /*
-           * Normally auth creates this,
-           * but create it safely if missing.
+           * Auth normally creates all
+           * progress rows, but this makes
+           * the route resilient.
            */
           await client.query(
             `
@@ -585,7 +659,10 @@ export function gameRoutes(app) {
               1,
               0
             )
-            ON CONFLICT (user_id, mode)
+            ON CONFLICT (
+              user_id,
+              mode
+            )
             DO NOTHING
             `,
             [
@@ -598,8 +675,17 @@ export function gameRoutes(app) {
         }
 
 
-        if (level > MAX_LEVEL) {
-          await client.query("ROLLBACK");
+        /*
+         * Never allow a level outside
+         * the configured range.
+         */
+        if (
+          level < 1 ||
+          level > MAX_LEVEL
+        ) {
+          await client.query(
+            "ROLLBACK"
+          );
 
           return res.status(400).json({
             success: false,
@@ -610,7 +696,7 @@ export function gameRoutes(app) {
 
 
         /*
-         * Get the server-side word.
+         * Server chooses the word.
          */
         const word =
           getWordForLevel(
@@ -629,16 +715,25 @@ export function gameRoutes(app) {
         }
 
 
+        const normalizedWord =
+          word
+            .trim()
+            .toUpperCase();
+
+
+        /*
+         * Create authoritative puzzle.
+         */
         const puzzle =
           createPuzzle(
-            word,
+            normalizedWord,
             GAME_CONFIG[mode].gaps
           );
 
 
-        const hash =
+        const puzzleHash =
           createPuzzleHash(
-            word,
+            normalizedWord,
             puzzle
           );
 
@@ -655,7 +750,7 @@ export function gameRoutes(app) {
 
 
         /*
-         * Store the authoritative puzzle.
+         * Create game session.
          */
         await client.query(
           `
@@ -686,13 +781,21 @@ export function gameRoutes(app) {
           `,
           [
             sessionId,
+
             user.id,
+
             mode,
+
             level,
-            word,
+
+            normalizedWord,
+
             JSON.stringify(puzzle),
-            hash,
+
+            puzzleHash,
+
             GAME_CONFIG[mode].reward,
+
             expiresAt
           ]
         );
@@ -700,19 +803,18 @@ export function gameRoutes(app) {
 
         /*
          * Consume one life.
+         *
+         * If the user had 5 lives before
+         * consuming this life, start the
+         * next regeneration timer now.
          */
-        const updatedUser =
+        const updatedUserResult =
           await client.query(
             `
             UPDATE users
             SET
               lives = lives - 1,
 
-              /*
-               * When dropping below max,
-               * NOW() becomes the start of the
-               * next regeneration cycle.
-               */
               last_life_at =
                 CASE
                   WHEN lives = $2
@@ -731,11 +833,20 @@ export function gameRoutes(app) {
           );
 
 
-        await client.query("COMMIT");
+        if (!updatedUserResult.rows.length) {
+          throw new Error(
+            "Unable to consume life"
+          );
+        }
+
+
+        await client.query(
+          "COMMIT"
+        );
 
 
         const finalUser =
-          updatedUser.rows[0];
+          updatedUserResult.rows[0];
 
 
         return res.json({
@@ -757,8 +868,7 @@ export function gameRoutes(app) {
             },
 
             reward:
-              GAME_CONFIG[mode]
-                .reward,
+              GAME_CONFIG[mode].reward,
 
             expiresAt
           },
@@ -770,10 +880,14 @@ export function gameRoutes(app) {
               ),
 
             lives:
-              finalUser.lives,
+              Number(
+                finalUser.lives
+              ),
 
             hints:
-              finalUser.hints
+              Number(
+                finalUser.hints
+              )
           }
         });
 
@@ -785,8 +899,9 @@ export function gameRoutes(app) {
           );
         } catch {}
 
+
         /*
-         * PostgreSQL unique-index race:
+         * PostgreSQL partial unique index:
          * one_active_game_per_user
          */
         if (
@@ -846,11 +961,30 @@ export function gameRoutes(app) {
           .toUpperCase();
 
 
-      if (!sessionId || !answer) {
+      if (
+        !sessionId ||
+        !answer
+      ) {
         return res.status(400).json({
           success: false,
           message:
             "Session ID and answer are required"
+        });
+      }
+
+
+      /*
+       * Prevent excessively large
+       * request values.
+       */
+      if (
+        sessionId.length > 100 ||
+        answer.length > 100
+      ) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Invalid game submission"
         });
       }
 
@@ -860,11 +994,17 @@ export function gameRoutes(app) {
 
 
       try {
-        await client.query("BEGIN");
+        await client.query(
+          "BEGIN"
+        );
 
 
         /*
-         * Lock the game session.
+         * Lock the session.
+         *
+         * This guarantees that two simultaneous
+         * submit requests cannot both receive
+         * the reward.
          */
         const sessionResult =
           await client.query(
@@ -883,7 +1023,9 @@ export function gameRoutes(app) {
 
 
         if (!sessionResult.rows.length) {
-          await client.query("ROLLBACK");
+          await client.query(
+            "ROLLBACK"
+          );
 
           return res.status(404).json({
             success: false,
@@ -898,12 +1040,14 @@ export function gameRoutes(app) {
 
 
         /*
-         * Already completed/expired.
+         * The session must still be active.
          */
         if (
           session.status !== "started"
         ) {
-          await client.query("ROLLBACK");
+          await client.query(
+            "ROLLBACK"
+          );
 
           return res.status(400).json({
             success: false,
@@ -925,10 +1069,11 @@ export function gameRoutes(app) {
           await client.query(
             `
             UPDATE game_sessions
-            SET status = 'expired'
+            SET
+              status = 'expired'
             WHERE id = $1
             `,
-            [sessionId]
+            [session.id]
           );
 
 
@@ -946,10 +1091,13 @@ export function gameRoutes(app) {
 
 
         /*
-         * Normalize the server answer.
+         * The correct answer comes only
+         * from the server database.
          */
         const correctAnswer =
-          String(session.word)
+          String(
+            session.word
+          )
             .trim()
             .toUpperCase();
 
@@ -959,10 +1107,11 @@ export function gameRoutes(app) {
 
 
         /*
-         * Wrong answer does NOT award coins.
+         * Wrong answer:
          *
-         * The game remains active so the player
-         * can try again.
+         * No coins.
+         * No level progress.
+         * Game remains active.
          */
         if (!correct) {
 
@@ -984,7 +1133,10 @@ export function gameRoutes(app) {
 
 
         /*
-         * SERVER-CALCULATED REWARD
+         * SERVER-CALCULATED REWARD.
+         *
+         * Never accept reward amount
+         * from the frontend.
          */
         const reward =
           Number(
@@ -992,17 +1144,34 @@ export function gameRoutes(app) {
           );
 
 
+        if (
+          !Number.isSafeInteger(
+            reward
+          ) ||
+          reward <= 0
+        ) {
+          throw new Error(
+            "Invalid stored game reward"
+          );
+        }
+
+
         /*
-         * Update coins and total games.
+         * Reward the user.
          */
         const userResult =
           await client.query(
             `
             UPDATE users
             SET
-              coins = coins + $2,
-              total_games = total_games + 1
+              coins =
+                coins + $2,
+
+              total_games =
+                total_games + 1
+
             WHERE id = $1
+
             RETURNING *
             `,
             [
@@ -1024,7 +1193,7 @@ export function gameRoutes(app) {
 
 
         /*
-         * Record the coin transaction.
+         * Record coin transaction.
          */
         await client.query(
           `
@@ -1062,15 +1231,34 @@ export function gameRoutes(app) {
 
 
         /*
-         * Mark the game completed.
+         * IMPORTANT:
+         *
+         * Add this game's reward toward
+         * the referred user's 1,000-coin
+         * qualification requirement.
+         *
+         * This runs INSIDE the same transaction.
+         */
+        await processReferralProgress(
+          client,
+          user.id,
+          reward
+        );
+
+
+        /*
+         * Mark session completed.
          */
         await client.query(
           `
           UPDATE game_sessions
           SET
             status = 'completed',
+
             completed_at = NOW(),
+
             completion_token = $2
+
           WHERE id = $1
           `,
           [
@@ -1084,7 +1272,9 @@ export function gameRoutes(app) {
 
 
         /*
-         * Advance the player's level.
+         * Advance mode level.
+         *
+         * Level 100 remains the maximum.
          */
         await client.query(
           `
@@ -1097,15 +1287,20 @@ export function gameRoutes(app) {
           VALUES (
             $1,
             $2,
+
             CASE
               WHEN $3 >= $4
               THEN $4
               ELSE $3 + 1
             END,
+
             1
           )
 
-          ON CONFLICT (user_id, mode)
+          ON CONFLICT (
+            user_id,
+            mode
+          )
 
           DO UPDATE SET
 
@@ -1124,13 +1319,21 @@ export function gameRoutes(app) {
           `,
           [
             user.id,
+
             session.mode,
-            session.level,
+
+            Number(
+              session.level
+            ),
+
             MAX_LEVEL
           ]
         );
 
 
+        /*
+         * Everything succeeded.
+         */
         await client.query(
           "COMMIT"
         );
@@ -1145,16 +1348,24 @@ export function gameRoutes(app) {
 
           user: {
             coins:
-              Number(user.coins),
+              Number(
+                user.coins
+              ),
 
             lives:
-              user.lives,
+              Number(
+                user.lives
+              ),
 
             hints:
-              user.hints,
+              Number(
+                user.hints
+              ),
 
             totalGames:
-              user.total_games
+              Number(
+                user.total_games
+              )
           },
 
           game: {
@@ -1162,14 +1373,20 @@ export function gameRoutes(app) {
               session.mode,
 
             level:
-              session.level,
+              Number(
+                session.level
+              ),
 
-            completed: true,
+            completed:
+              true,
 
             nextLevel:
               Math.min(
                 MAX_LEVEL,
-                Number(session.level) + 1
+
+                Number(
+                  session.level
+                ) + 1
               )
           }
         });
