@@ -1,9 +1,22 @@
 import crypto from "crypto";
 import pool from "../db/pool.js";
-import { requireAuth } from "../middleware/requireAuth.js";
+
+import { requireAuth } from "../middleware/auth.js";
+
+/*
+|--------------------------------------------------------------------------
+| CONFIG
+|--------------------------------------------------------------------------
+*/
 
 const MIN_WITHDRAWAL = 5000;
 const COINS_PER_USD = 10000;
+
+/*
+ * Maximum number of pending withdrawals allowed
+ * for one user at the same time.
+ */
+const MAX_PENDING_WITHDRAWALS = 3;
 
 const ALLOWED_METHODS = [
   "faucetpay",
@@ -11,15 +24,57 @@ const ALLOWED_METHODS = [
   "mlbb"
 ];
 
+/*
+ * Basic destination length protection.
+ *
+ * Actual destination validation can be made more specific
+ * when we implement the individual payout providers.
+ */
+const MAX_DESTINATION_LENGTH = 255;
+
+
+/*
+|--------------------------------------------------------------------------
+| HELPERS
+|--------------------------------------------------------------------------
+*/
+
+function normalizeMethod(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase();
+}
+
+function normalizeDestination(value) {
+  return String(value || "")
+    .trim();
+}
+
+function calculateUsd(coins) {
+  return coins / COINS_PER_USD;
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| ROUTES
+|--------------------------------------------------------------------------
+*/
+
 export function withdrawalRoutes(app) {
+
   /*
-   * GET WITHDRAWAL HISTORY
-   */
+  |--------------------------------------------------------------------------
+  | GET WITHDRAWAL HISTORY
+  |--------------------------------------------------------------------------
+  */
+
   app.get(
     "/api/withdrawals",
     requireAuth,
     async (req, res) => {
       try {
+
         const result = await pool.query(
           `
           SELECT
@@ -35,65 +90,211 @@ export function withdrawalRoutes(app) {
           FROM withdrawals
           WHERE user_id = $1
           ORDER BY created_at DESC
+          LIMIT 100
           `,
-          [req.user.id]
+          [req.userId]
         );
 
-        res.json({
+        return res.json({
           success: true,
 
-          withdrawals: result.rows.map(row => ({
-            id: row.id,
-            method: row.method,
-            amountCoins: Number(row.amount_coins),
-            amountUsd: Number(row.amount_usd || 0),
-            destination: row.destination,
-            status: row.status,
-            adminNote: row.admin_note,
-            createdAt: row.created_at,
-            processedAt: row.processed_at
-          }))
-        });
-      } catch (error) {
-        console.error("Withdrawal history:", error);
+          withdrawals:
+            result.rows.map(
+              (row) => ({
+                id: row.id,
 
-        res.status(500).json({
+                method:
+                  row.method,
+
+                amountCoins:
+                  Number(
+                    row.amount_coins
+                  ),
+
+                amountUsd:
+                  Number(
+                    row.amount_usd || 0
+                  ),
+
+                destination:
+                  row.destination,
+
+                status:
+                  row.status,
+
+                adminNote:
+                  row.admin_note,
+
+                createdAt:
+                  row.created_at,
+
+                processedAt:
+                  row.processed_at
+              })
+            )
+        });
+
+      } catch (error) {
+
+        console.error(
+          "Withdrawal history error:",
+          error
+        );
+
+        return res.status(500).json({
           success: false,
-          message: "Unable to load withdrawals"
+          message:
+            "Unable to load withdrawals"
         });
       }
     }
   );
 
+
   /*
-   * CREATE WITHDRAWAL
-   */
+  |--------------------------------------------------------------------------
+  | GET WITHDRAWAL SUMMARY
+  |--------------------------------------------------------------------------
+  */
+
+  app.get(
+    "/api/withdrawals/summary",
+    requireAuth,
+    async (req, res) => {
+      try {
+
+        const result = await pool.query(
+          `
+          SELECT
+            coins
+          FROM users
+          WHERE id = $1
+          LIMIT 1
+          `,
+          [req.userId]
+        );
+
+        if (!result.rows.length) {
+          return res.status(404).json({
+            success: false,
+            message: "User not found"
+          });
+        }
+
+        const coins =
+          Number(
+            result.rows[0].coins || 0
+          );
+
+        return res.json({
+          success: true,
+
+          balance: {
+            coins,
+
+            estimatedUsd:
+              calculateUsd(coins)
+          },
+
+          withdrawal: {
+            minimumCoins:
+              MIN_WITHDRAWAL,
+
+            coinsPerUsd:
+              COINS_PER_USD,
+
+            minimumUsd:
+              calculateUsd(
+                MIN_WITHDRAWAL
+              ),
+
+            methods:
+              ALLOWED_METHODS
+          }
+        });
+
+      } catch (error) {
+
+        console.error(
+          "Withdrawal summary error:",
+          error
+        );
+
+        return res.status(500).json({
+          success: false,
+          message:
+            "Unable to load withdrawal information"
+        });
+      }
+    }
+  );
+
+
+  /*
+  |--------------------------------------------------------------------------
+  | CREATE WITHDRAWAL
+  |--------------------------------------------------------------------------
+  */
+
   app.post(
     "/api/withdrawals",
     requireAuth,
     async (req, res) => {
-      const method = String(
-        req.body?.method || ""
-      ).toLowerCase();
 
-      const amountCoins = Number(
-        req.body?.amountCoins
-      );
+      const method =
+        normalizeMethod(
+          req.body?.method
+        );
 
-      const destination = String(
-        req.body?.destination || ""
-      ).trim();
+      const amountCoins =
+        Number(
+          req.body?.amountCoins
+        );
 
-      if (!ALLOWED_METHODS.includes(method)) {
+      const destination =
+        normalizeDestination(
+          req.body?.destination
+        );
+
+
+      /*
+       * Validate withdrawal method.
+       */
+      if (
+        !ALLOWED_METHODS.includes(
+          method
+        )
+      ) {
         return res.status(400).json({
           success: false,
-          message: "Invalid withdrawal method"
+          message:
+            "Invalid withdrawal method"
         });
       }
 
+
+      /*
+       * Only whole coins are accepted.
+       */
       if (
-        !Number.isSafeInteger(amountCoins) ||
-        amountCoins < MIN_WITHDRAWAL
+        !Number.isSafeInteger(
+          amountCoins
+        )
+      ) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Withdrawal amount must be a whole number"
+        });
+      }
+
+
+      /*
+       * Minimum withdrawal.
+       */
+      if (
+        amountCoins <
+        MIN_WITHDRAWAL
       ) {
         return res.status(400).json({
           success: false,
@@ -102,69 +303,210 @@ export function withdrawalRoutes(app) {
         });
       }
 
-      if (!destination) {
+
+      /*
+       * Protect against absurdly large
+       * request bodies.
+       */
+      if (
+        amountCoins >
+        Number.MAX_SAFE_INTEGER
+      ) {
         return res.status(400).json({
           success: false,
-          message: "Destination is required"
+          message:
+            "Invalid withdrawal amount"
         });
       }
 
+
+      /*
+       * Destination validation.
+       */
+      if (!destination) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Destination is required"
+        });
+      }
+
+      if (
+        destination.length >
+        MAX_DESTINATION_LENGTH
+      ) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Destination is too long"
+        });
+      }
+
+
+      /*
+       * Calculate USD on the server.
+       */
       const amountUsd =
-        amountCoins / COINS_PER_USD;
-
-      const client = await pool.connect();
-
-      try {
-        await client.query("BEGIN");
-
-        const userResult = await client.query(
-          `
-          SELECT *
-          FROM users
-          WHERE id = $1
-          FOR UPDATE
-          `,
-          [req.user.id]
+        calculateUsd(
+          amountCoins
         );
 
-        const user = userResult.rows[0];
 
-        if (!user) {
-          await client.query("ROLLBACK");
+      const client =
+        await pool.connect();
+
+      try {
+
+        await client.query(
+          "BEGIN"
+        );
+
+
+        /*
+         * Lock the user row.
+         *
+         * This prevents two simultaneous withdrawal
+         * requests from spending the same coins.
+         */
+        const userResult =
+          await client.query(
+            `
+            SELECT
+              id,
+              coins
+            FROM users
+            WHERE id = $1
+            FOR UPDATE
+            `,
+            [req.userId]
+          );
+
+
+        if (!userResult.rows.length) {
+
+          await client.query(
+            "ROLLBACK"
+          );
 
           return res.status(404).json({
             success: false,
-            message: "User not found"
+            message:
+              "User not found"
           });
         }
 
-        if (Number(user.coins) < amountCoins) {
-          await client.query("ROLLBACK");
+
+        const user =
+          userResult.rows[0];
+
+
+        /*
+         * Check existing pending withdrawals
+         * while the user row is locked.
+         */
+        const pendingResult =
+          await client.query(
+            `
+            SELECT COUNT(*)::int AS count
+            FROM withdrawals
+            WHERE
+              user_id = $1
+              AND status = 'pending'
+            `,
+            [req.userId]
+          );
+
+
+        const pendingCount =
+          Number(
+            pendingResult.rows[0].count
+          );
+
+
+        if (
+          pendingCount >=
+          MAX_PENDING_WITHDRAWALS
+        ) {
+
+          await client.query(
+            "ROLLBACK"
+          );
 
           return res.status(400).json({
             success: false,
-            message: "Insufficient coins"
+            message:
+              "You already have too many pending withdrawals"
           });
         }
 
+
         /*
-         * Deduct coins immediately.
+         * Check balance.
          */
-        const updated = await client.query(
-          `
-          UPDATE users
-          SET coins = coins - $2
-          WHERE id = $1
-          RETURNING *
-          `,
-          [user.id, amountCoins]
-        );
+        const currentCoins =
+          Number(user.coins || 0);
 
-        const updatedUser = updated.rows[0];
 
+        if (
+          currentCoins <
+          amountCoins
+        ) {
+
+          await client.query(
+            "ROLLBACK"
+          );
+
+          return res.status(400).json({
+            success: false,
+            message:
+              "Insufficient coins"
+          });
+        }
+
+
+        /*
+         * Generate withdrawal ID.
+         */
         const withdrawalId =
           crypto.randomUUID();
 
+
+        /*
+         * Deduct coins atomically.
+         */
+        const updated =
+          await client.query(
+            `
+            UPDATE users
+            SET
+              coins =
+                coins - $2
+            WHERE id = $1
+            RETURNING
+              coins
+            `,
+            [
+              req.userId,
+              amountCoins
+            ]
+          );
+
+
+        if (!updated.rows.length) {
+
+          throw new Error(
+            "Failed to update user balance"
+          );
+        }
+
+
+        const newBalance =
+          updated.rows[0].coins;
+
+
+        /*
+         * Create withdrawal record.
+         */
         await client.query(
           `
           INSERT INTO withdrawals (
@@ -188,7 +530,7 @@ export function withdrawalRoutes(app) {
           `,
           [
             withdrawalId,
-            user.id,
+            req.userId,
             method,
             amountCoins,
             amountUsd,
@@ -196,6 +538,10 @@ export function withdrawalRoutes(app) {
           ]
         );
 
+
+        /*
+         * Record the balance movement.
+         */
         await client.query(
           `
           INSERT INTO coin_transactions (
@@ -216,42 +562,70 @@ export function withdrawalRoutes(app) {
           )
           `,
           [
-            user.id,
+            req.userId,
+
             -amountCoins,
-            updatedUser.coins,
+
+            newBalance,
+
             withdrawalId,
+
             `Withdrawal via ${method}`
           ]
         );
 
-        await client.query("COMMIT");
 
-        res.json({
+        await client.query(
+          "COMMIT"
+        );
+
+
+        return res.json({
           success: true,
 
           withdrawal: {
-            id: withdrawalId,
+            id:
+              withdrawalId,
+
             method,
+
             amountCoins,
+
             amountUsd,
+
             destination,
-            status: "pending"
+
+            status:
+              "pending"
           },
 
           user: {
-            coins: Number(updatedUser.coins)
+            coins:
+              Number(
+                newBalance
+              )
           }
         });
+
       } catch (error) {
-        await client.query("ROLLBACK");
 
-        console.error("Create withdrawal:", error);
+        await client.query(
+          "ROLLBACK"
+        );
 
-        res.status(500).json({
+        console.error(
+          "Create withdrawal error:",
+          error
+        );
+
+        return res.status(500).json({
           success: false,
-          message: "Unable to create withdrawal"
+          message:
+            "Unable to create withdrawal"
         });
+
       } finally {
+
         client.release();
       }
     }
