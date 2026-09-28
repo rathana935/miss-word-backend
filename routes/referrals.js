@@ -1,6 +1,7 @@
 import pool from "../db/pool.js";
 import { requireAuth } from "../middleware/auth.js";
 
+
 /*
 |--------------------------------------------------------------------------
 | CONFIG
@@ -10,60 +11,85 @@ import { requireAuth } from "../middleware/auth.js";
 const REQUIRED_COINS = 1000;
 const REFERRAL_REWARD = 1000;
 
+
 /*
 |--------------------------------------------------------------------------
 | HELPERS
 |--------------------------------------------------------------------------
 */
 
+
 /**
- * Build the Telegram Mini App referral URL.
+ * Build Telegram Mini App referral URL.
+ *
+ * Expected:
+ * BOT_USERNAME=my_bot
+ *
+ * Result:
+ * https://t.me/my_bot/app?startapp=ref_XXXX
  */
 function buildReferralLink(referralCode) {
-  const botUsername = String(
-    process.env.BOT_USERNAME || ""
-  )
-    .trim()
-    .replace(/^@/, "");
+  const botUsername =
+    String(
+      process.env.BOT_USERNAME || ""
+    )
+      .trim()
+      .replace(/^@/, "");
 
-  if (!botUsername || !referralCode) {
+  if (
+    !botUsername ||
+    !referralCode
+  ) {
     return "";
   }
 
-  return `https://t.me/${botUsername}/app?startapp=ref_${encodeURIComponent(
-    referralCode
-  )}`;
+  return (
+    `https://t.me/${botUsername}/app?startapp=ref_` +
+    encodeURIComponent(
+      referralCode
+    )
+  );
 }
 
 
-/**
- * Update referral progress when an invited user
- * earns qualifying coins.
- *
- * IMPORTANT:
- * This function must be called INSIDE the same PostgreSQL
- * transaction that awards the qualifying coins.
- *
- * Example:
- *
- * await processReferralProgress(
- *   client,
- *   referredUserId,
- *   10
- * );
- *
- * This prevents referral progress from becoming different
- * from the user's actual coin transaction.
- */
+/*
+|--------------------------------------------------------------------------
+| PROCESS REFERRAL PROGRESS
+|--------------------------------------------------------------------------
+|
+| IMPORTANT:
+|
+| This function MUST be called inside the same PostgreSQL
+| transaction that awards the qualifying coins.
+|
+| Example:
+|
+| await processReferralProgress(
+|   client,
+|   user.id,
+|   reward
+| );
+|
+| If the transaction rolls back, both the game reward
+| and referral progress/reward roll back together.
+|
+|--------------------------------------------------------------------------
+*/
+
 export async function processReferralProgress(
   client,
   referredUserId,
   earnedCoins
 ) {
-  const amount = Number(earnedCoins);
+
+  /*
+   * Only positive integer coin rewards qualify.
+   */
+  const amount =
+    Number(earnedCoins);
 
   if (
-    !Number.isFinite(amount) ||
+    !Number.isSafeInteger(amount) ||
     amount <= 0
   ) {
     return {
@@ -72,104 +98,168 @@ export async function processReferralProgress(
     };
   }
 
-  /*
-   * Lock the referral row.
-   *
-   * A user can only have one referral because the database
-   * schema has a unique constraint on referred_user_id.
-   */
-  const referralResult = await client.query(
-    `
-    SELECT
-      id,
-      referrer_id,
-      referred_user_id,
-      qualifying_coins,
-      required_coins,
-      reward_coins,
-      rewarded
-    FROM referrals
-    WHERE referred_user_id = $1
-    FOR UPDATE
-    `,
-    [referredUserId]
-  );
 
-  if (!referralResult.rows.length) {
+  /*
+   * Find and lock the referral record.
+   *
+   * referred_user_id is unique in the database,
+   * so one user can only have one referrer.
+   */
+  const referralResult =
+    await client.query(
+      `
+      SELECT
+        id,
+        referrer_id,
+        referred_user_id,
+        qualifying_coins,
+        required_coins,
+        reward_coins,
+        rewarded
+      FROM referrals
+      WHERE referred_user_id = $1
+      FOR UPDATE
+      `,
+      [referredUserId]
+    );
+
+
+  /*
+   * This user was not referred.
+   */
+  if (
+    !referralResult.rows.length
+  ) {
     return {
       rewarded: false,
       progressCoins: 0
     };
   }
 
+
   const referral =
     referralResult.rows[0];
 
+
   /*
-   * Already rewarded.
+   * Already completed.
    */
-  if (referral.rewarded) {
+  if (
+    referral.rewarded === true
+  ) {
     return {
       rewarded: false,
+
       alreadyRewarded: true,
-      progressCoins: Number(
-        referral.qualifying_coins || 0
-      )
+
+      progressCoins:
+        Number(
+          referral.qualifying_coins || 0
+        )
     };
   }
 
-  const currentProgress = Number(
-    referral.qualifying_coins || 0
-  );
-
-  const requiredCoins = Number(
-    referral.required_coins ||
-      REQUIRED_COINS
-  );
-
-  const rewardCoins = Number(
-    referral.reward_coins ||
-      REFERRAL_REWARD
-  );
 
   /*
-   * Never allow progress to exceed the requirement.
+   * Read configuration from the referral row.
+   *
+   * Database values take priority because they
+   * represent the referral agreement created
+   * when the user joined.
    */
-  const newProgress = Math.min(
-    requiredCoins,
-    currentProgress + amount
-  );
+  const requiredCoins =
+    Number(
+      referral.required_coins
+    );
+
+  const rewardCoins =
+    Number(
+      referral.reward_coins
+    );
+
 
   /*
-   * Update referral progress.
+   * Validate stored referral configuration.
    */
-  await client.query(
-    `
-    UPDATE referrals
-    SET
-      qualifying_coins = $2,
-      rewarded =
-        CASE
-          WHEN $2 >= required_coins
-          THEN TRUE
-          ELSE rewarded
-        END
-    WHERE id = $1
-    `,
-    [
-      referral.id,
-      newProgress
-    ]
-  );
+  if (
+    !Number.isSafeInteger(
+      requiredCoins
+    ) ||
+    requiredCoins <= 0
+  ) {
+    throw new Error(
+      "Invalid referral required_coins configuration"
+    );
+  }
+
+
+  if (
+    !Number.isSafeInteger(
+      rewardCoins
+    ) ||
+    rewardCoins <= 0
+  ) {
+    throw new Error(
+      "Invalid referral reward_coins configuration"
+    );
+  }
+
+
+  /*
+   * Current progress.
+   */
+  const currentProgress =
+    Math.max(
+      0,
+      Number(
+        referral.qualifying_coins || 0
+      )
+    );
+
+
+  /*
+   * Add the newly earned qualifying coins.
+   *
+   * Never allow progress to exceed the
+   * required amount.
+   */
+  const newProgress =
+    Math.min(
+      requiredCoins,
+      currentProgress + amount
+    );
+
 
   /*
    * Not qualified yet.
    */
-  if (newProgress < requiredCoins) {
+  if (
+    newProgress < requiredCoins
+  ) {
+
+    await client.query(
+      `
+      UPDATE referrals
+      SET
+        qualifying_coins = $2
+      WHERE id = $1
+      `,
+      [
+        referral.id,
+        newProgress
+      ]
+    );
+
+
+    /*
+     * Keep users.referral_progress_coins
+     * synchronized for fast frontend access.
+     */
     await client.query(
       `
       UPDATE users
-      SET referral_progress_coins = $2
+      SET
+        referral_progress_coins = $2
       WHERE id = $1
       `,
       [
@@ -178,47 +268,72 @@ export async function processReferralProgress(
       ]
     );
 
+
     return {
       rewarded: false,
-      progressCoins: newProgress
+
+      progressCoins:
+        newProgress
     };
   }
 
-  /*
-   * Referral has qualified.
-   *
-   * The referrer receives the reward.
-   */
-  const referrerResult = await client.query(
-    `
-    UPDATE users
-    SET
-      coins = coins + $2,
-      successful_referrals =
-        successful_referrals + 1
-    WHERE id = $1
-    RETURNING
-      id,
-      coins,
-      successful_referrals
-    `,
-    [
-      referral.referrer_id,
-      rewardCoins
-    ]
-  );
 
-  if (!referrerResult.rows.length) {
+  /*
+   * =========================================================
+   * REFERRAL QUALIFIED
+   * =========================================================
+   *
+   * The referred user has now reached
+   * the required qualifying coin amount.
+   */
+
+
+  /*
+   * Reward the referrer.
+   *
+   * PostgreSQL automatically locks this user's row
+   * while performing the UPDATE.
+   */
+  const referrerResult =
+    await client.query(
+      `
+      UPDATE users
+      SET
+        coins =
+          coins + $2,
+
+        successful_referrals =
+          successful_referrals + 1
+
+      WHERE id = $1
+
+      RETURNING
+        id,
+        coins,
+        successful_referrals
+      `,
+      [
+        referral.referrer_id,
+        rewardCoins
+      ]
+    );
+
+
+  if (
+    !referrerResult.rows.length
+  ) {
     throw new Error(
       "Referral referrer user not found"
     );
   }
 
+
   const referrer =
     referrerResult.rows[0];
 
+
   /*
-   * Record the referral coin reward.
+   * Record the referral reward.
    */
   await client.query(
     `
@@ -236,19 +351,30 @@ export async function processReferralProgress(
       $3,
       'referral_reward',
       $4,
-      'Referral reward'
+      $5
     )
     `,
     [
       referral.referrer_id,
+
       rewardCoins,
+
       referrer.coins,
-      String(referral.id)
+
+      String(
+        referral.id
+      ),
+
+      `Referral reward for user ${referredUserId}`
     ]
   );
 
+
   /*
-   * Store final referral state.
+   * Mark referral as completed.
+   *
+   * This happens in the same transaction as
+   * the referrer coin reward.
    */
   await client.query(
     `
@@ -264,14 +390,15 @@ export async function processReferralProgress(
     ]
   );
 
+
   /*
-   * The invited user's progress is also stored in users
-   * so the frontend can display it quickly.
+   * Store the final progress on the referred user.
    */
   await client.query(
     `
     UPDATE users
-    SET referral_progress_coins = $2
+    SET
+      referral_progress_coins = $2
     WHERE id = $1
     `,
     [
@@ -280,11 +407,17 @@ export async function processReferralProgress(
     ]
   );
 
+
   return {
     rewarded: true,
+
     rewardCoins,
-    progressCoins: requiredCoins,
-    referrerId: referral.referrer_id
+
+    progressCoins:
+      requiredCoins,
+
+    referrerId:
+      referral.referrer_id
   };
 }
 
@@ -297,6 +430,7 @@ export async function processReferralProgress(
 
 export function referralRoutes(app) {
 
+
   /*
   |--------------------------------------------------------------------------
   | GET REFERRAL INFORMATION
@@ -307,71 +441,84 @@ export function referralRoutes(app) {
     "/api/referrals",
     requireAuth,
     async (req, res) => {
+
       try {
+
         /*
          * Get current user's referral information.
          */
-        const userResult = await pool.query(
-          `
-          SELECT
-            referral_code,
-            successful_referrals,
-            referral_progress_coins
-          FROM users
-          WHERE id = $1
-          LIMIT 1
-          `,
-          [req.userId]
-        );
+        const userResult =
+          await pool.query(
+            `
+            SELECT
+              referral_code,
+              successful_referrals,
+              referral_progress_coins
+            FROM users
+            WHERE id = $1
+            LIMIT 1
+            `,
+            [req.userId]
+          );
 
-        if (!userResult.rows.length) {
+
+        if (
+          !userResult.rows.length
+        ) {
           return res.status(404).json({
             success: false,
-            message: "User not found"
+            message:
+              "User not found"
           });
         }
+
 
         const user =
           userResult.rows[0];
 
+
         /*
-         * Get invited users/referrals.
+         * Get users invited by this user.
          */
         const referralResult =
           await pool.query(
             `
             SELECT
               r.id,
-
               r.qualifying_coins,
               r.required_coins,
               r.reward_coins,
-
               r.rewarded,
               r.created_at,
 
               u.username,
               u.first_name,
               u.last_name
+
             FROM referrals r
 
             LEFT JOIN users u
-              ON u.id = r.referred_user_id
+              ON u.id =
+                 r.referred_user_id
 
             WHERE r.referrer_id = $1
 
-            ORDER BY r.created_at DESC
+            ORDER BY
+              r.created_at DESC
             `,
             [req.userId]
           );
 
+
         const referralCode =
           user.referral_code || "";
+
 
         const referralLink =
           buildReferralLink(
             referralCode
           );
+
 
         return res.json({
           success: true,
@@ -387,8 +534,7 @@ export function referralRoutes(app) {
 
           progressCoins:
             Number(
-              user.referral_progress_coins ||
-                0
+              user.referral_progress_coins || 0
             ),
 
           requiredCoins:
@@ -399,13 +545,14 @@ export function referralRoutes(app) {
 
           referrals:
             referralResult.rows.map(
-              (referral) => ({
-                id: referral.id,
+              referral => ({
+
+                id:
+                  referral.id,
 
                 qualifyingCoins:
                   Number(
-                    referral.qualifying_coins ||
-                      0
+                    referral.qualifying_coins || 0
                   ),
 
                 requiredCoins:
@@ -446,8 +593,9 @@ export function referralRoutes(app) {
         });
 
       } catch (error) {
+
         console.error(
-          "Referral load error:",
+          "GET /api/referrals:",
           error
         );
 
@@ -466,7 +614,7 @@ export function referralRoutes(app) {
   | GET REFERRAL SUMMARY
   |--------------------------------------------------------------------------
   |
-  | A smaller endpoint useful for the dashboard.
+  | Lightweight endpoint for dashboard widgets.
   |
   */
 
@@ -474,29 +622,38 @@ export function referralRoutes(app) {
     "/api/referrals/summary",
     requireAuth,
     async (req, res) => {
-      try {
-        const result = await pool.query(
-          `
-          SELECT
-            referral_code,
-            successful_referrals,
-            referral_progress_coins
-          FROM users
-          WHERE id = $1
-          LIMIT 1
-          `,
-          [req.userId]
-        );
 
-        if (!result.rows.length) {
+      try {
+
+        const result =
+          await pool.query(
+            `
+            SELECT
+              referral_code,
+              successful_referrals,
+              referral_progress_coins
+            FROM users
+            WHERE id = $1
+            LIMIT 1
+            `,
+            [req.userId]
+          );
+
+
+        if (
+          !result.rows.length
+        ) {
           return res.status(404).json({
             success: false,
-            message: "User not found"
+            message:
+              "User not found"
           });
         }
 
+
         const user =
           result.rows[0];
+
 
         return res.json({
           success: true,
@@ -516,8 +673,7 @@ export function referralRoutes(app) {
 
           progressCoins:
             Number(
-              user.referral_progress_coins ||
-                0
+              user.referral_progress_coins || 0
             ),
 
           requiredCoins:
@@ -528,8 +684,9 @@ export function referralRoutes(app) {
         });
 
       } catch (error) {
+
         console.error(
-          "Referral summary error:",
+          "GET /api/referrals/summary:",
           error
         );
 
