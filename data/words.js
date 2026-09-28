@@ -338,12 +338,30 @@ export const WORDS = [
   "PROTECTION",
   "CREATION",
   "DECISION",
-
+  "DISCOVERY",
+  "MOTIVATION",
+  "ADDITIONAL",
+  "DIRECTION",
+  "ADVENTUROUS",
+  "COMMUNICATION",
+  "OPERATION",
+  "PROTECTION",
+  "CREATION",
+  "DECISION",
 
   // ==========================================================
   // DIFFICULT 1-100
   // ==========================================================
-
+  "AUTHENTICATION",
+  "TRANSACTIONAL",
+  "CONFIGURATION",
+  "REGISTRATION",
+  "IDENTIFICATION",
+  "AUTHORIZATION",
+  "RESPONSIBILITY",
+  "ACHIEVEMENT",
+  "IMPLEMENTATION",
+  "TRANSFORMATION",
   "TECHNOLOGY",
   "APPLICATION",
   "DEVELOPMENT",
